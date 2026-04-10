@@ -1,0 +1,22 @@
+# Secrets & session state
+secrets.env
+browser_state.json
+last_state.json
+figi_cache.json
+mirror.log
+
+# Exploration / scratch files
+*.json
+*.png
+*.html
+capture_*.py
+explore_*.py
+login_*.py
+step*.py
+PLAN.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
