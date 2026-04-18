@@ -57,7 +57,7 @@ def http_post(url, payload, headers=None):
     with urllib.request.urlopen(req) as r:
         return json.loads(r.read())
 
-# ── Citrindex client ──────────────────────────────────────────────────────────
+# ── Tracker client ────────────────────────────────────────────────────────────
 
 def load_session_cookie():
     """Read the session cookie from the saved Playwright browser state."""
