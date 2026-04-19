@@ -1,11 +1,4 @@
-"""
-Portfolio Tracker Re-Authentication Script
-
-Runs headlessly — designed for server/cron deployment.
-Uses IMAP to read the OTP from a Gmail inbox automatically.
-
-Trigger manually or automatically when the session is expiring.
-"""
+"""Headless re-authentication via Playwright + IMAP OTP polling."""
 
 import asyncio
 import imaplib
@@ -31,13 +24,6 @@ STATE_FILE         = Path(__file__).parent / "browser_state.json"
 # ── Gmail IMAP OTP reader ─────────────────────────────────────────────────────
 
 def fetch_otp_from_gmail(max_wait=90, poll_interval=4, connect_retries=5, connect_backoff=6):
-    """
-    Poll Gmail via IMAP for an OTP email.
-    Waits up to max_wait seconds, checking every poll_interval seconds.
-    Retries the initial IMAP connection up to connect_retries times with
-    connect_backoff seconds between attempts (handles post-sleep network delay).
-    Returns the 6-digit OTP string, or raises TimeoutError.
-    """
     print(f"Polling Gmail for OTP (up to {max_wait}s)...")
     deadline = time.time() + max_wait
     mail = None

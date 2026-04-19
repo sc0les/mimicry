@@ -1,12 +1,6 @@
 """
-Portfolio Mirror → Alpaca
-
-Fetches holdings from a portfolio tracker API, resolves FIGIs to tickers via OpenFIGI,
-filters to US-listed equities/ETFs only (skips options, foreign stocks),
-then rebalances the Alpaca paper account to match those weights.
-
-Supports long and short positions. Options are skipped.
-Run on a schedule (every 15–30 min during market hours).
+Mirrors a portfolio tracker into an Alpaca paper trading account.
+Resolves FIGIs via OpenFIGI, filters to US equities, and rebalances on a schedule.
 """
 
 import json
@@ -93,11 +87,6 @@ def fetch_holdings(date_str=None):
     return r.json()
 
 def compute_raw_weights(holdings):
-    """
-    Compute portfolio-level weight for every FIGI.
-    Returns: (long_weights, short_weights) where each is {figi: abs_weight_pct}.
-    Short weights are stored as positive numbers representing the magnitude of the short.
-    """
     long_weights = {}
     short_weights = {}
 
@@ -137,11 +126,6 @@ def save_figi_cache(cache):
         json.dump(cache, f, indent=2)
 
 def resolve_figis(figis):
-    """
-    Map FIGIs → {ticker, securityType, securityType2, exchCode} via OpenFIGI.
-    Uses a local cache to avoid redundant API calls.
-    Returns: dict of {figi: info_dict or None}
-    """
     cache = load_figi_cache()
     to_resolve = [f for f in figis if f not in cache]
 
@@ -180,7 +164,6 @@ def resolve_figis(figis):
     return cache
 
 def is_tradeable_us_equity(info):
-    """Return True if this security is a US-listed equity or ETF (no options, no foreign)."""
     if info is None:
         return False
     sec_type = info.get("securityType", "") or ""
@@ -317,11 +300,6 @@ def check_session_expiry():
                 print(f"Session valid for {days_left:.1f} more days.")
 
 def check_and_reduce_margin(dry_run=False):
-    """
-    If maintenance_margin / equity exceeds MARGIN_BUFFER_THRESHOLD, close
-    short positions starting with the worst unrealized loss until we're back
-    under the threshold. Returns True if any action was taken.
-    """
     account = get_account()
     equity = float(account["equity"])
     maintenance_margin = float(account["maintenance_margin"])
