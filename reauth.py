@@ -129,7 +129,6 @@ def reauth():
 # ── Session expiry check ──────────────────────────────────────────────────────
 
 def session_expires_in_days():
-    """Return days until session expires, or 0 if expired/missing."""
     if not STATE_FILE.exists():
         return 0
     with open(STATE_FILE) as f:

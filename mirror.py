@@ -60,7 +60,6 @@ def http_post(url, payload, headers=None):
 # ── Tracker client ────────────────────────────────────────────────────────────
 
 def load_session_cookie():
-    """Read the session cookie from the saved Playwright browser state."""
     if not SESSION_FILE.exists():
         raise RuntimeError(f"Session file not found: {SESSION_FILE}\nRun login_and_explore.py to authenticate.")
     with open(SESSION_FILE) as f:
@@ -74,7 +73,6 @@ def load_session_cookie():
     raise RuntimeError("Session cookie not found in browser state file.")
 
 def fetch_holdings(date_str=None):
-    """Fetch portfolio holdings for a given date (defaults to today)."""
     if date_str is None:
         date_str = datetime.date.today().isoformat()
     raw_cookie = load_session_cookie()
@@ -225,7 +223,6 @@ def get_positions():
     return {p["symbol"]: p for p in positions}
 
 def get_latest_price(ticker):
-    """Get latest trade price for a ticker via Alpaca data API."""
     url = f"https://data.alpaca.markets/v2/stocks/{ticker}/trades/latest"
     try:
         data = http_get(url, alpaca_headers())
@@ -234,7 +231,6 @@ def get_latest_price(ticker):
         return None
 
 def is_tradeable_on_alpaca(ticker):
-    """Check if Alpaca can trade this ticker (asset must be active and fractionable)."""
     try:
         data = http_get(f"{ALPACA_BASE_URL}/v2/assets/{ticker}", alpaca_headers())
         return data.get("status") == "active" and data.get("tradable", False)
@@ -244,7 +240,6 @@ def is_tradeable_on_alpaca(ticker):
         raise
 
 def place_order(ticker, side, notional=None, qty=None):
-    """Place a market order. Uses notional (dollar amount) for fractional shares."""
     payload = {
         "symbol": ticker,
         "side": side,
@@ -267,7 +262,6 @@ def place_order(ticker, side, notional=None, qty=None):
         return None
 
 def close_position(ticker):
-    """Close entire position in a ticker."""
     req = urllib.request.Request(
         f"{ALPACA_BASE_URL}/v2/positions/{ticker}",
         method="DELETE",
@@ -296,7 +290,6 @@ def save_state(state):
 # ── Main sync logic ───────────────────────────────────────────────────────────
 
 def check_market_open():
-    """Return True if US market is currently open via Alpaca clock."""
     try:
         clock = http_get(f"{ALPACA_BASE_URL}/v2/clock", alpaca_headers())
         return clock.get("is_open", False)
@@ -305,7 +298,6 @@ def check_market_open():
         return False
 
 def check_session_expiry():
-    """Auto-reauth if session is expiring within 2 days."""
     if not SESSION_FILE.exists():
         print("No session file found — running reauth...")
         import reauth
@@ -357,15 +349,13 @@ def check_and_reduce_margin(dry_run=False):
         ticker = pos["symbol"]
         unreal_pl = float(pos.get("unrealized_pl", 0))
         mkt_val = abs(float(pos["market_value"]))
-        # Estimate margin relief: Alpaca short maintenance margin is ~30% of market value
-        estimated_margin_relief = mkt_val * 0.30
+        estimated_margin_relief = mkt_val * 0.30  # ~30% Alpaca short maintenance margin
 
         print(f"  Closing short {ticker} (unrealized P&L: ${unreal_pl:+,.2f}, ~${estimated_margin_relief:,.0f} margin relief)...")
         if not dry_run:
             close_position(ticker)
             time.sleep(0.5)
 
-        # Re-fetch account to check if we're back under threshold
         if not dry_run:
             account = get_account()
             equity = float(account["equity"])
@@ -376,7 +366,6 @@ def check_and_reduce_margin(dry_run=False):
                 print("  Margin buffer restored.")
                 break
         else:
-            # In dry run, simulate relief
             maintenance_margin -= estimated_margin_relief
             ratio = maintenance_margin / equity
             if ratio <= MARGIN_BUFFER_THRESHOLD:
@@ -404,8 +393,8 @@ def run_sync(dry_run=False):
     all_figis = list(set(list(raw_long_weights.keys()) + list(raw_short_weights.keys())))
     figi_info = resolve_figis(all_figis)
 
-    target_weights = {}  # ticker → weight_pct (long)
-    target_short_weights = {}  # ticker → abs_weight_pct (short)
+    target_weights = {}
+    target_short_weights = {}
     skipped = []
     for figi, weight in raw_long_weights.items():
         info = figi_info.get(figi)
@@ -418,9 +407,8 @@ def run_sync(dry_run=False):
     for figi, weight in raw_short_weights.items():
         info = figi_info.get(figi)
         if not is_tradeable_us_equity(info):
-            continue  # already captured in skipped via longs if applicable
+            continue
         ticker = info["ticker"]
-        # If a ticker appears as both long and short, net them out
         if ticker in target_weights:
             net = target_weights[ticker] - weight
             if net > 0:
