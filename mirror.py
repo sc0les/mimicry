@@ -277,8 +277,8 @@ def check_market_open():
         clock = http_get(f"{ALPACA_BASE_URL}/v2/clock", alpaca_headers())
         return clock.get("is_open", False)
     except Exception as e:
-        print(f"Warning: could not check market status: {e}")
-        return False
+        print(f"Warning: could not check market status: {e} — assuming open, proceeding")
+        return True
 
 def check_session_expiry():
     if not SESSION_FILE.exists():
