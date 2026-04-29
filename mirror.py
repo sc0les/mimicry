@@ -295,7 +295,13 @@ def check_session_expiry():
             if days_left < 2:
                 print(f"Session expires in {days_left:.1f} days — re-authenticating automatically...")
                 import reauth
-                reauth.reauth()
+                try:
+                    reauth.reauth()
+                except Exception as e:
+                    print(f"Reauth failed: {e}")
+                    if days_left <= 0:
+                        raise
+                    print(f"Continuing with existing session ({days_left:.1f} days remaining)")
             else:
                 print(f"Session valid for {days_left:.1f} more days.")
 
