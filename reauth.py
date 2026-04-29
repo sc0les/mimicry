@@ -20,6 +20,8 @@ TRACKER_LOGIN_URL  = os.environ["TRACKER_LOGIN_URL"]
 TRACKER_OTP_SENDER = os.environ["TRACKER_OTP_SENDER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"].replace(" ", "")
 STATE_FILE         = Path(__file__).parent / "browser_state.json"
+FAILURE_FILE       = Path(__file__).parent / "last_reauth_failure"
+COOLDOWN_SECONDS   = 3600  # don't retry for 1 hour after a failed attempt
 
 # ── Gmail IMAP OTP reader ─────────────────────────────────────────────────────
 
@@ -93,14 +95,26 @@ async def run_login():
 
         print("Entering OTP...")
         otp_input = page.locator('input[placeholder="OTP"], input[type="text"], input[type="number"]').first
-        await otp_input.fill(otp)
-        await page.wait_for_timeout(500)
-        await page.click('button:has-text("Continue with OTP"), button[type="submit"]')
+        await otp_input.click()
+        await page.keyboard.type(otp, delay=80)
+        await page.wait_for_timeout(1000)
+
+        await page.keyboard.press("Enter")
+        await page.wait_for_timeout(2000)
+
+        if "sign-in" in page.url:
+            try:
+                await page.click('button:has-text("Continue with OTP"), button[type="submit"]', timeout=2000)
+            except Exception:
+                pass
+
         await page.wait_for_load_state("networkidle")
         await page.wait_for_timeout(3000)
 
         if "sign-in" in page.url:
-            raise RuntimeError(f"Login failed — still on sign-in page. URL: {page.url}")
+            screenshot_path = Path(__file__).parent / f"reauth_failure_{int(time.time())}.png"
+            await page.screenshot(path=str(screenshot_path))
+            raise RuntimeError(f"Login failed — still on sign-in page. URL: {page.url} (screenshot: {screenshot_path.name})")
 
         print(f"Logged in. URL: {page.url}")
 
@@ -110,7 +124,20 @@ async def run_login():
         await browser.close()
 
 def reauth():
-    asyncio.run(run_login())
+    if FAILURE_FILE.exists():
+        elapsed = time.time() - FAILURE_FILE.stat().st_mtime
+        if elapsed < COOLDOWN_SECONDS:
+            remaining = int((COOLDOWN_SECONDS - elapsed) / 60)
+            print(f"Skipping reauth — last attempt failed {int(elapsed/60)} min ago, cooling down {remaining} more min")
+            return
+
+    try:
+        asyncio.run(run_login())
+        if FAILURE_FILE.exists():
+            FAILURE_FILE.unlink()
+    except Exception:
+        FAILURE_FILE.touch()
+        raise
 
 # ── Session expiry check ──────────────────────────────────────────────────────
 
