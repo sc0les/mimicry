@@ -2,10 +2,21 @@
 secrets.env
 browser_state.json
 last_state.json
+last_state_ibkr.json
+ibkr_execution_ledger.json
+KILLSWITCH
+last_success_*.json
 last_reauth_failure
 reauth_failure_*.png
 figi_cache.json
+ibkr_contract_cache.json
 mirror.log
+mirror_ibkr.log
+mirror_ibkr_execute.log
+reconcile.log
+reconcile_alert_state.json
+daily_summary.log
+deadman.log
 
 # Exploration / scratch files
 *.json
@@ -16,6 +27,7 @@ explore_*.py
 login_*.py
 step*.py
 PLAN.md
+WIKI.md
 
 # Python
 __pycache__/
