@@ -14,6 +14,7 @@ import math
 from pathlib import Path
 import requests as _requests
 from dotenv import load_dotenv
+import alerts
 
 load_dotenv(Path(__file__).parent / "secrets.env")
 
@@ -23,6 +24,7 @@ SESSION_FILE       = Path(__file__).parent / "browser_state.json"
 PORTFOLIO_SLUG     = os.environ["PORTFOLIO_SLUG"]
 STATE_FILE         = Path(__file__).parent / "last_state.json"
 FIGI_CACHE_FILE    = Path(__file__).parent / "figi_cache.json"
+KILLSWITCH_FILE    = Path(__file__).parent / "KILLSWITCH"
 
 ALPACA_API_KEY    = os.environ["ALPACA_API_KEY"]
 ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
@@ -363,6 +365,12 @@ def run_sync(dry_run=False):
     print(f"\n{'='*60}")
     print(f"Portfolio Mirror — {datetime.datetime.now().isoformat()}")
     print(f"{'='*60}")
+
+    if KILLSWITCH_FILE.exists():
+        message = f"Alpaca runner halted because {KILLSWITCH_FILE} exists"
+        print(message)
+        alerts.send_alert("Mimicry Alpaca halted", message, priority=1)
+        raise SystemExit(75)
 
     check_session_expiry()
 

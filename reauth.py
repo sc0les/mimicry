@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from playwright.async_api import async_playwright
 from dotenv import load_dotenv
+import alerts
 
 load_dotenv(Path(__file__).parent / "secrets.env")
 
@@ -135,8 +136,9 @@ def reauth():
         asyncio.run(run_login())
         if FAILURE_FILE.exists():
             FAILURE_FILE.unlink()
-    except Exception:
+    except Exception as exc:
         FAILURE_FILE.touch()
+        alerts.send_alert("Mimicry reauth failure", str(exc), priority=1)
         raise
 
 # ── Session expiry check ──────────────────────────────────────────────────────
