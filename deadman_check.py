@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import os
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -13,10 +14,8 @@ import alerts
 
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_MARKERS = [
-    ROOT / "last_success_ibkr_execute_paper.json",
-    ROOT / "last_success_alpaca_mirror.json",
-]
+def default_marker(mode: str) -> Path:
+    return ROOT / f"last_success_ibkr_execute_{mode}.json"
 
 
 def parse_hhmm(value: str) -> datetime.time:
@@ -50,6 +49,11 @@ def marker_finished_at(path: Path) -> datetime.datetime | None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Alert if Mimicry cron jobs stop succeeding")
     parser.add_argument("--max-age-minutes", type=float, default=60.0)
+    parser.add_argument(
+        "--mode",
+        choices=["paper", "live"],
+        default=os.environ.get("IBKR_EXECUTION_MODE", "paper"),
+    )
     parser.add_argument("--timezone", default="America/New_York")
     parser.add_argument("--market-start", default="09:30")
     parser.add_argument("--market-end", default="16:00")
@@ -64,7 +68,7 @@ def main() -> None:
         print(f"Outside market window ({now.isoformat()}); deadman check skipped")
         return
 
-    marker_paths = [Path(path) for path in args.marker] if args.marker else DEFAULT_MARKERS
+    marker_paths = [Path(path) for path in args.marker] if args.marker else [default_marker(args.mode)]
     stale = []
     for marker in marker_paths:
         finished = marker_finished_at(marker)

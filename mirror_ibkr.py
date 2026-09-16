@@ -15,6 +15,8 @@ from pathlib import Path
 
 import alerts
 import ibkr_contracts
+import ibkr_execution
+import ibkr_state
 import mirror
 
 
@@ -176,7 +178,10 @@ def target_universe(figi_info: dict, mode: str) -> set[str]:
             continue
         if mode == "foreign_only" and ibkr_contracts.is_foreign_equity(info):
             universe.add(figi)
-        elif mode == "all_equities" and not ibkr_contracts.is_option_or_derivative(info):
+        elif mode == "all_equities" and (
+            ibkr_contracts.is_option(info)
+            or not ibkr_contracts.is_option_or_derivative(info)
+        ):
             universe.add(figi)
     return universe
 
@@ -244,9 +249,13 @@ def build_rows(holdings: dict, mode: str, portfolio_value: float) -> tuple[list[
         target_value = abs(weight) / 100 * portfolio_value
         price = estimate_price(holdings, figi)
         local_target_value = None
-        raw_shares = target_value / price if price else None
-        min_lot_value = plan.lot_size * price if price else None
+        unit_multiplier = plan.multiplier if plan.sec_type == "OPT" else 1.0
+        raw_shares = target_value / (price * unit_multiplier) if price else None
+        min_lot_value = plan.lot_size * price * unit_multiplier if price else None
         lots, rounded_shares = lot_sizing(raw_shares, plan.lot_size, target_value, min_lot_value)
+        if plan.sec_type == "OPT" and target_value > 0 and price:
+            rounded_shares = max(1, rounded_shares or 0)
+            lots = rounded_shares
         signed_target_qty = -rounded_shares if rounded_shares and weight < 0 else rounded_shares
         skip_reason = None
 
@@ -270,6 +279,7 @@ def build_rows(holdings: dict, mode: str, portfolio_value: float) -> tuple[list[
             "local_target_value": local_target_value,
             "price": price,
             "price_multiplier": plan.price_multiplier,
+            "multiplier": plan.multiplier,
             "price_source": "mimicry_close" if price else None,
             "fx_rate": None,
             "raw_shares": raw_shares,
@@ -282,7 +292,18 @@ def build_rows(holdings: dict, mode: str, portfolio_value: float) -> tuple[list[
             "con_id": plan.con_id,
             "local_symbol": plan.local_symbol,
             "trading_class": plan.trading_class,
+            "sec_type": plan.sec_type,
+            "expiry": plan.expiry,
+            "strike": plan.strike,
+            "right": plan.right,
+            "underlying_symbol": plan.underlying_symbol,
+            "underlying_sec_type": plan.underlying_sec_type,
+            "settlement_type": plan.settlement_type,
+            "liquid_hours": plan.liquid_hours,
+            "trading_hours": plan.trading_hours,
+            "time_zone_id": plan.time_zone_id,
             "min_tick": plan.min_tick,
+            "market_rules": plan.market_rules,
             "skip_reason": skip_reason,
             "needs_contract_details": plan.needs_contract_details,
         })
@@ -298,9 +319,17 @@ def recalc_row_sizing(row: dict, price: float | None, fx_rate: float | None, pri
     price_is_usd = price_source == "mimicry_close"
     effective_fx = 1.0 if price_is_usd else fx_rate
     row["local_target_value"] = row["target_value"] / effective_fx if price and effective_fx else None
-    row["raw_shares"] = row["local_target_value"] / price if row["local_target_value"] and price else None
-    min_lot_value = row["lot_size"] * price * effective_fx if price and effective_fx else None
+    multiplier = row.get("multiplier") or 1.0
+    row["raw_shares"] = (
+        row["local_target_value"] / (price * multiplier)
+        if row["local_target_value"] and price
+        else None
+    )
+    min_lot_value = row["lot_size"] * price * multiplier * effective_fx if price and effective_fx else None
     lots, row["rounded_shares"] = lot_sizing(row["raw_shares"], row["lot_size"], row["target_value"], min_lot_value)
+    if row.get("sec_type") == "OPT" and row["target_value"] > 0 and price:
+        row["rounded_shares"] = max(1, row["rounded_shares"] or 0)
+        lots = row["rounded_shares"]
     row["target_qty"] = -row["rounded_shares"] if row["rounded_shares"] and row["weight"] < 0 else row["rounded_shares"]
 
     if price is None:
@@ -486,6 +515,110 @@ def qualify_rows(rows: list[dict], limit: int | None = None) -> None:
         ib.disconnect()
 
 
+def apply_plan_to_row(row: dict, plan: ibkr_contracts.ContractPlan) -> None:
+    row.update({
+        "ticker": plan.symbol,
+        "exchange": plan.exchange,
+        "currency": plan.currency,
+        "country": plan.country,
+        "con_id": plan.con_id,
+        "local_symbol": plan.local_symbol,
+        "trading_class": plan.trading_class,
+        "sec_type": plan.sec_type,
+        "lot_size": plan.lot_size,
+        "min_tick": plan.min_tick,
+        "market_rules": plan.market_rules,
+        "multiplier": plan.multiplier,
+        "price_multiplier": plan.price_multiplier,
+        "expiry": plan.expiry,
+        "strike": plan.strike,
+        "right": plan.right,
+        "underlying_symbol": plan.underlying_symbol,
+        "underlying_sec_type": plan.underlying_sec_type,
+        "settlement_type": plan.settlement_type,
+        "liquid_hours": plan.liquid_hours,
+        "trading_hours": plan.trading_hours,
+        "time_zone_id": plan.time_zone_id,
+        "needs_contract_details": plan.needs_contract_details,
+    })
+    if plan.con_id and not plan.needs_contract_details:
+        row["skip_reason"] = None
+
+
+def qualify_execution_rows(ib, rows: list[dict]) -> dict[int, ibkr_contracts.ContractPlan]:
+    cache = ibkr_contracts.load_contract_cache()
+    plans_by_con_id = {}
+    changed = False
+    for row in rows:
+        cached = cache.get(row.get("figi"))
+        if not cached:
+            continue
+        plan = ibkr_contracts.ContractPlan(**cached)
+        needs_qualification = (
+            not plan.con_id
+            or plan.needs_contract_details
+            or not plan.market_rules
+            or not ibkr_contracts.schedule_covers_current_date(plan.liquid_hours)
+            or (plan.sec_type == "OPT" and not plan.local_symbol)
+        )
+        if needs_qualification:
+            qualified, error = ibkr_contracts.qualify_contract_plan(ib, plan)
+            if qualified is None:
+                row["skip_reason"] = f"contract qualification failed: {error}"
+                continue
+            plan = qualified
+            cache[row["figi"]] = ibkr_contracts.asdict(plan)
+            changed = True
+        apply_plan_to_row(row, plan)
+        if plan.con_id:
+            plans_by_con_id[int(plan.con_id)] = plan
+    if changed:
+        ibkr_contracts.save_contract_cache(cache)
+    return plans_by_con_id
+
+
+def qualify_held_positions(
+    ib,
+    positions: list[dict],
+    plans_by_con_id: dict[int, ibkr_contracts.ContractPlan],
+) -> list[dict]:
+    enriched_positions = []
+    for position in positions:
+        con_id = int(position.get("con_id") or 0)
+        if not con_id or position.get("sec_type") not in {"STK", "OPT"}:
+            enriched_positions.append(position)
+            continue
+        plan = plans_by_con_id.get(con_id)
+        if plan is None:
+            plan, error = ibkr_contracts.qualify_position_plan(ib, position)
+            if plan is None:
+                enriched_positions.append({
+                    **position,
+                    "qualification_error": error,
+                })
+                continue
+            plans_by_con_id[con_id] = plan
+        enriched_positions.append({
+            **position,
+            "ticker": plan.symbol,
+            "local_symbol": plan.local_symbol or position.get("local_symbol"),
+            "exchange": plan.exchange,
+            "currency": plan.currency,
+            "sec_type": plan.sec_type,
+            "multiplier": plan.multiplier,
+            "price_multiplier": plan.price_multiplier,
+            "expiry": plan.expiry,
+            "strike": plan.strike,
+            "right": plan.right,
+            "market_rules": plan.market_rules,
+            "lot_size": plan.lot_size,
+            "liquid_hours": plan.liquid_hours,
+            "trading_hours": plan.trading_hours,
+            "time_zone_id": plan.time_zone_id,
+        })
+    return enriched_positions
+
+
 def print_ibkr_account_snapshot() -> None:
     print("\nReading IBKR account snapshot...")
     ib = ibkr_contracts.connect_ibkr()
@@ -512,13 +645,30 @@ def print_open_orders(cancel: bool = False) -> None:
     print("\nReading IBKR open orders...")
     ib = ibkr_contracts.connect_ibkr()
     try:
-        trades = all_open_trades(ib)
-        print(f"  Open orders: {len(trades)}")
-        if cancel and trades:
-            ib.reqGlobalCancel()
-            ib.sleep(3)
-            trades = all_open_trades(ib)
-            print(f"  Global cancel requested; remaining open orders: {len(trades)}")
+        account_id = ibkr_contracts.require_account_id(ib)
+        trades = [
+            trade
+            for trade in all_open_trades(ib)
+            if str(getattr(trade.order, "account", "") or "") == account_id
+        ]
+        owned = [
+            trade
+            for trade in trades
+            if str(getattr(trade.order, "orderRef", "") or "").startswith(
+                ibkr_execution.ORDER_REF_PREFIX
+            )
+        ]
+        print(f"  Account open orders: {len(trades)} | Mimicry-owned: {len(owned)}")
+        if cancel and owned:
+            remaining = ibkr_execution.cancel_owned_orders(ib, account_id)
+            trades = [
+                trade
+                for trade in all_open_trades(ib)
+                if str(getattr(trade.order, "account", "") or "") == account_id
+            ]
+            print(
+                f"  Mimicry-owned cancel requested; owned remaining: {len(remaining)}"
+            )
         for trade in trades:
             contract = trade.contract
             order = trade.order
@@ -533,22 +683,14 @@ def print_open_orders(cancel: bool = False) -> None:
 
 
 def cancel_open_orders_for_paper() -> int:
-    print("\nCancelling open IBKR paper orders before execution...")
+    print("\nCancelling Mimicry-owned IBKR orders before execution...")
     ib = ibkr_contracts.connect_ibkr()
     try:
-        trades = all_open_trades(ib)
-        before = len(trades)
-        print(f"  Open orders before cancel: {before}")
-        if before:
-            ib.reqGlobalCancel()
-        remaining = before
-        for _attempt in range(10):
-            ib.sleep(3)
-            remaining = len(all_open_trades(ib))
-            if remaining == 0:
-                break
-        print(f"  Open orders after cancel: {remaining}")
-        return remaining
+        account_id = ibkr_contracts.require_account_id(ib)
+        before = len(ibkr_execution.owned_open_trades(ib, account_id))
+        remaining = ibkr_execution.cancel_owned_orders(ib, account_id)
+        print(f"  Mimicry-owned orders before cancel: {before}; after: {len(remaining)}")
+        return len(remaining)
     finally:
         ib.disconnect()
 
@@ -571,7 +713,8 @@ def ibkr_positions_by_con_id() -> dict[int, dict]:
 def ibkr_working_orders_by_con_id() -> dict[int, float]:
     ib = ibkr_contracts.connect_ibkr()
     try:
-        trades = all_open_trades(ib)
+        account_id = ibkr_contracts.require_account_id(ib)
+        trades = ibkr_execution.owned_open_trades(ib, account_id)
     finally:
         ib.disconnect()
 
@@ -718,7 +861,7 @@ def print_order_preview(orders: list[dict]) -> None:
         limit = f"{order['limit_price']}" if order["limit_price"] is not None else "MISSING_LIMIT"
         short_note = f" short_open={order['short_open_qty']}" if order.get("opens_short") else ""
         print(
-            f"  {order['side']:4s} {order['qty']:7d} {order['ticker']:12s} "
+            f"  {order['side']:4s} {order['qty']:7g} {order['ticker']:12s} "
             f"{order['exchange']:8s} {order['currency']:3s} "
             f"current={order['current_qty']:,.0f} working={order.get('working_qty', 0):,.0f} "
             f"target={order['target_qty']:,.0f} "
@@ -753,26 +896,31 @@ def executable_orders(
 
 
 def load_execution_ledger() -> list[dict]:
-    if not IBKR_EXECUTION_LEDGER_FILE.exists():
-        return []
-    data = json.loads(IBKR_EXECUTION_LEDGER_FILE.read_text())
-    if isinstance(data, dict):
-        return data.get("orders", [])
-    return data
+    connection = ibkr_state.connect()
+    try:
+        ibkr_state.import_legacy_ledger(connection)
+        return [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM orders ORDER BY created_at"
+            ).fetchall()
+        ]
+    finally:
+        connection.close()
 
 
 def save_execution_ledger(entries: list[dict]) -> None:
-    IBKR_EXECUTION_LEDGER_FILE.write_text(json.dumps({"orders": entries}, indent=2, sort_keys=True))
+    raise RuntimeError(
+        "JSON execution-ledger writes are disabled; use mimicry_state.sqlite3"
+    )
 
 
 def daily_execution_count(date: datetime.date | None = None) -> int:
-    date = date or datetime.date.today()
-    date_key = date.isoformat()
-    return sum(
-        1
-        for entry in load_execution_ledger()
-        if entry.get("date") == date_key and entry.get("status") not in NON_COUNTING_EXECUTION_STATUSES
-    )
+    connection = ibkr_state.connect()
+    try:
+        return ibkr_state.todays_order_count(connection, day=date)
+    finally:
+        connection.close()
 
 
 def trade_log_messages(trade) -> list[str]:
@@ -814,46 +962,10 @@ def update_order_status_from_trade(order: dict, trade, submitted_at: float | Non
 
 
 def record_submitted_orders(submitted_orders: list[dict]) -> None:
-    if not submitted_orders:
-        return
-    now = datetime.datetime.now()
-    entries = load_execution_ledger()
-    for order in submitted_orders:
-        entries.append({
-            "timestamp": now.isoformat(),
-            "date": now.date().isoformat(),
-            "figi": order.get("figi"),
-            "con_id": order.get("con_id"),
-            "ticker": order.get("ticker"),
-            "exchange": order.get("exchange"),
-            "currency": order.get("currency"),
-            "side": order.get("side"),
-            "qty": order.get("qty"),
-            "requested_qty": order.get("requested_qty", order.get("qty")),
-            "filled_qty": order.get("filled_qty"),
-            "remaining_qty": order.get("remaining_qty"),
-            "avg_fill_price": order.get("avg_fill_price"),
-            "last_fill_price": order.get("last_fill_price"),
-            "time_to_fill_seconds": order.get("time_to_fill_seconds"),
-            "limit_price": order.get("limit_price"),
-            "estimated_notional_usd": order.get("estimated_notional_usd"),
-            "status": order.get("status"),
-            "final_status": order.get("final_status", order.get("status")),
-            "order_id": order.get("order_id"),
-            "perm_id": order.get("perm_id"),
-            "order_routing": order.get("order_routing"),
-            "order_type": order.get("order_type"),
-            "opens_short": order.get("opens_short"),
-            "short_open_qty": order.get("short_open_qty"),
-            "fx_rate": order.get("fx_rate"),
-            "target_qty": order.get("target_qty"),
-            "target_weight": order.get("target_weight"),
-            "rejection_reason": order.get("rejection_reason"),
-            "reason": order.get("reason"),
-            "messages": order.get("messages", []),
-            "run_id": order.get("run_id"),
-        })
-    save_execution_ledger(entries)
+    if submitted_orders:
+        raise RuntimeError(
+            "legacy batch recording is disabled; persist intents before placeOrder"
+        )
 
 
 def execute_orders(
@@ -865,6 +977,9 @@ def execute_orders(
     order_type: str,
     verify_shortability: bool = True,
 ) -> list[dict]:
+    raise RuntimeError(
+        "legacy execution is disabled; use run_execution() for transactional submission"
+    )
     selected, rejected = executable_orders(orders, max_orders, max_notional, order_type)
     print(f"\nIBKR execution: submitting {len(selected)} {order_type} orders; holding back {len(rejected)}")
     for order in rejected[:20]:
@@ -1028,9 +1143,14 @@ def validate_execution_mode(confirm_paper: bool, confirm_live: bool) -> str:
     if confirm_paper == confirm_live:
         raise SystemExit("--execute requires exactly one of --confirm-paper or --confirm-live")
 
-    account_ids = ibkr_account_ids()
-    is_paper = connection_looks_paper(account_ids)
-    account_label = ", ".join(account_ids) if account_ids else "unknown account"
+    ib = ibkr_contracts.connect_ibkr()
+    try:
+        account_id = ibkr_contracts.require_account_id(ib)
+        account_ids = ibkr_contracts.managed_account_ids(ib)
+    finally:
+        ib.disconnect()
+    is_paper = connection_looks_paper([account_id])
+    account_label = account_id
     if confirm_paper and not is_paper:
         raise SystemExit(f"--confirm-paper used but IBKR connection does not look like paper: {account_label}")
     if confirm_live and is_paper:
@@ -1128,9 +1248,403 @@ def load_holdings_from_file(path: str) -> dict:
     raise SystemExit(f"Could not find a holdings payload in {path}")
 
 
+def net_liquidation_from_summary(summary: dict) -> float:
+    item = summary.get("NetLiquidation")
+    if not item:
+        raise RuntimeError("IBKR NetLiquidation was not available for the configured account")
+    if item.get("currency") and item["currency"] != "USD":
+        raise RuntimeError(
+            f"IBKR NetLiquidation is not USD: {item['value']} {item['currency']}"
+        )
+    value = float(item["value"])
+    if not math.isfinite(value) or value <= 0:
+        raise RuntimeError(f"IBKR NetLiquidation is invalid: {value}")
+    return value
+
+
+def validate_connected_execution_mode(
+    ib,
+    confirm_paper: bool,
+    confirm_live: bool,
+) -> tuple[str, str]:
+    if confirm_paper == confirm_live:
+        raise RuntimeError("--execute requires exactly one of --confirm-paper or --confirm-live")
+    account_id = ibkr_contracts.require_account_id(ib)
+    account_looks_paper = account_id.upper().startswith("DU")
+    port = int(ibkr_contracts.ibkr_config()["port"])
+    if confirm_paper and not account_looks_paper:
+        raise RuntimeError(
+            f"--confirm-paper does not match configured account {account_id}; paper accounts begin with DU"
+        )
+    if confirm_live and account_looks_paper:
+        raise RuntimeError(
+            f"--confirm-live does not match configured paper account {account_id}"
+        )
+    if confirm_paper and port == 4001:
+        raise RuntimeError("--confirm-paper is connected to the standard live Gateway port 4001")
+    if confirm_live and port == 4002:
+        raise RuntimeError("--confirm-live is connected to the standard paper Gateway port 4002")
+    return ("paper" if confirm_paper else "live"), account_id
+
+
+def strict_execution_profile(args: argparse.Namespace) -> None:
+    if args.order_type != "limit":
+        raise RuntimeError("IBKR paper and live execution require marketable limit orders")
+    args.max_orders = min(
+        args.max_orders if args.max_orders is not None else ibkr_execution.MAX_ORDERS_PER_RUN,
+        ibkr_execution.MAX_ORDERS_PER_RUN,
+    )
+    args.max_notional = min(
+        args.max_notional if args.max_notional is not None else ibkr_execution.MAX_CHILD_NOTIONAL_USD,
+        ibkr_execution.MAX_CHILD_NOTIONAL_USD,
+    )
+    args.max_daily_orders = min(
+        args.max_daily_orders if args.max_daily_orders is not None else ibkr_execution.MAX_DAILY_ORDERS,
+        ibkr_execution.MAX_DAILY_ORDERS,
+    )
+
+
+def check_execution_netliq(
+    connection,
+    mode: str,
+    account_id: str,
+    netliq: float,
+) -> None:
+    previous = ibkr_state.last_completed_netliq(connection, mode, account_id)
+    baseline = ibkr_state.live_baseline(connection, account_id) if mode == "live" else None
+    reference = previous or baseline
+    if not reference:
+        return
+    previous_netliq = float(reference["netliq"])
+    change = (netliq - previous_netliq) / previous_netliq
+    if abs(change) > NETLIQ_ALERT_PCT:
+        alerts.send_alert(
+            "Mimicry IBKR NetLiq move",
+            f"{mode} {account_id}: NetLiq changed {change:+.2%}: "
+            f"${previous_netliq:,.2f} -> ${netliq:,.2f}",
+            priority=1,
+        )
+    if abs(change) > LIVE_NETLIQ_HALT_PCT:
+        raise RuntimeError(
+            f"NetLiq changed {change:+.2%} since the last completed {mode} run"
+        )
+
+
+def filter_short_orders(
+    ib,
+    orders: list[dict],
+    plans_by_con_id: dict[int, ibkr_contracts.ContractPlan],
+) -> tuple[list[dict], list[dict]]:
+    short_orders = [order for order in orders if order.get("opens_short")]
+    if not short_orders:
+        return orders, []
+    plans = {
+        int(order["con_id"]): plans_by_con_id[int(order["con_id"])]
+        for order in short_orders
+        if int(order["con_id"]) in plans_by_con_id
+    }
+    availability = ibkr_contracts.snapshot_shortability(ib, list(plans.values()))
+    accepted = []
+    held_back = []
+    for order in orders:
+        if not order.get("opens_short"):
+            accepted.append(order)
+            continue
+        data = availability.get(int(order["con_id"]), {})
+        score = data.get("shortable")
+        shares = data.get("shortable_shares")
+        required = float(order.get("short_open_qty") or order["qty"])
+        reason = None
+        if score != 3:
+            reason = f"shortability score must be 3 (received {score!r})"
+        elif shares is None or shares < required:
+            reason = f"shortable shares insufficient ({shares!r} < {required:g})"
+        if reason:
+            held_back.append({**order, "skip_reason": reason})
+        else:
+            accepted.append(order)
+    return accepted, held_back
+
+
+def run_execution(
+    args: argparse.Namespace,
+    holdings: dict,
+) -> tuple[list[dict], list[dict], list[dict], float, str]:
+    strict_execution_profile(args)
+    connection = ibkr_state.connect()
+    ibkr_state.import_legacy_ledger(connection)
+    ib = ibkr_contracts.connect_ibkr()
+    run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    run_started = False
+    mode = ""
+    account_id = ""
+    try:
+        mode, account_id = validate_connected_execution_mode(
+            ib,
+            args.confirm_paper,
+            args.confirm_live,
+        )
+        if mode == "live":
+            alerts.require_recent_self_test()
+
+        if args.initialize_live_baseline:
+            if mode != "live":
+                raise RuntimeError("--initialize-live-baseline requires --confirm-live")
+            summary, _positions = ibkr_contracts.account_snapshot(ib, account_id)
+            netliq = net_liquidation_from_summary(summary)
+            ibkr_state.set_live_baseline(connection, account_id, netliq)
+            print(
+                f"Initialized live baseline for {account_id}: NetLiq ${netliq:,.2f}; "
+                "no orders were submitted or cancelled"
+            )
+            return [], [], [], netliq, mode
+
+        ibkr_execution.recover_broker_orders(connection, ib, account_id)
+        remaining_owned = ibkr_execution.cancel_owned_orders(ib, account_id)
+        if remaining_owned:
+            raise RuntimeError(
+                f"{len(remaining_owned)} Mimicry-owned orders remained open after cancellation timeout"
+            )
+
+        summary, positions = ibkr_contracts.account_snapshot(ib, account_id)
+        netliq = net_liquidation_from_summary(summary)
+        if mode == "live" and not ibkr_state.live_baseline(connection, account_id):
+            raise RuntimeError(
+                "live baseline is missing; run once with --confirm-live "
+                "--initialize-live-baseline before submitting"
+            )
+        check_execution_netliq(connection, mode, account_id, netliq)
+        ibkr_state.start_run(
+            connection,
+            run_id,
+            mode,
+            account_id,
+            args.date,
+            netliq,
+        )
+        run_started = True
+
+        rows, skipped = build_rows(holdings, "all_equities", netliq)
+        plans_by_con_id = qualify_execution_rows(ib, rows)
+        positions = qualify_held_positions(ib, positions, plans_by_con_id)
+        unresolved_positions = [
+            position
+            for position in positions
+            if position.get("sec_type") in {"STK", "OPT"}
+            and position.get("position")
+            and position.get("qualification_error")
+        ]
+        if unresolved_positions:
+            labels = ", ".join(
+                f"{position.get('symbol')}({position.get('con_id')})"
+                for position in unresolved_positions
+            )
+            raise RuntimeError(f"held positions could not be qualified: {labels}")
+
+        quote_plans = list(plans_by_con_id.values())
+        quotes = ibkr_contracts.snapshot_quotes(ib, quote_plans)
+        currencies = {
+            plan.currency
+            for plan in quote_plans
+            if plan.sec_type in {"STK", "OPT"}
+        }
+        fx_quotes = ibkr_contracts.snapshot_fx_quotes(ib, currencies)
+        fx_rates, fx_errors = ibkr_execution.executable_fx_rates(currencies, fx_quotes)
+        if fx_errors:
+            message = "\n".join(
+                f"{currency}: {error}" for currency, error in sorted(fx_errors.items())
+            )
+            print(f"ERROR: IBKR FX unavailable:\n{message}")
+            alerts.send_alert("Mimicry IBKR FX unavailable", message, priority=1)
+
+        orders, planning_held = ibkr_execution.plan_order_deltas(
+            rows,
+            positions,
+            quotes,
+            fx_rates,
+            netliq,
+        )
+        for item in planning_held:
+            reason = item.get("skip_reason", "")
+            if any(token in reason.lower() for token in ("quote", "bid", "ask", "frozen", "stale")):
+                alerts.send_alert(
+                    "Mimicry IBKR quote unavailable",
+                    f"{item.get('ticker') or item.get('local_symbol')}: {reason}",
+                    priority=1,
+                )
+
+        used_today = ibkr_state.todays_order_count(connection)
+        selected, cap_held = ibkr_execution.slice_orders(
+            orders,
+            netliq,
+            used_today=used_today,
+            max_orders=args.max_orders,
+            max_daily_orders=args.max_daily_orders,
+            max_child_notional=args.max_notional,
+        )
+        selected, short_held = filter_short_orders(ib, selected, plans_by_con_id)
+        held_back = skipped + planning_held + cap_held + short_held
+        if short_held:
+            alerts.send_alert(
+                "Mimicry IBKR short unavailable",
+                "\n".join(
+                    f"{order.get('ticker')}: {order.get('skip_reason')}"
+                    for order in short_held
+                )[:1024],
+                priority=1,
+            )
+
+        proposed_notional = sum(float(order["actual_notional_usd"]) for order in selected)
+        if proposed_notional > netliq * LIVE_RUN_NOTIONAL_NETLIQ_HALT_PCT + 0.01:
+            raise RuntimeError(
+                f"selected run notional ${proposed_notional:,.2f} exceeds 25% of NetLiq"
+            )
+        if any(
+            float(order["actual_notional_usd"])
+            > min(LIVE_MAX_NOTIONAL_PER_ORDER, netliq * LIVE_SINGLE_ORDER_NETLIQ_HALT_PCT) + 0.01
+            for order in selected
+        ):
+            raise RuntimeError("a sliced child order exceeded the live single-order cap")
+
+        print_summary(rows, skipped, netliq, "all_equities")
+        print_order_preview(orders)
+        if held_back:
+            print(f"\nExecution held back/deferred: {len(held_back)}")
+            for item in held_back[:80]:
+                print(
+                    f"  HOLD {str(item.get('ticker') or item.get('local_symbol') or '?'):18s} "
+                    f"{item.get('skip_reason') or item.get('reason') or 'not executable'}"
+                )
+        print(
+            f"\nExecution selection: {len(selected)} orders, "
+            f"${proposed_notional:,.2f} actual limit notional; "
+            f"daily count before run {used_today}/{args.max_daily_orders}"
+        )
+
+        submitted = ibkr_execution.submit_orders(
+            ib,
+            connection,
+            account_id,
+            run_id,
+            selected,
+            plans_by_con_id,
+            outside_rth=args.allow_outside_rth,
+        )
+        ib.sleep(1)
+        ibkr_execution.recover_broker_orders(connection, ib, account_id)
+        ibkr_state.finish_run(connection, run_id, "completed")
+        ibkr_state.set_last_completed_netliq(connection, mode, account_id, netliq)
+        return rows, held_back, submitted, netliq, mode
+    except Exception as exc:
+        if run_started:
+            ibkr_state.finish_run(connection, run_id, "failed", str(exc))
+        if mode:
+            alerts.send_alert(
+                "Mimicry IBKR execution failed",
+                f"{mode} {account_id or '(unknown account)'}: {exc}",
+                priority=1,
+            )
+        raise
+    finally:
+        ib.disconnect()
+        connection.close()
+
+
+def run_execution_preview(
+    args: argparse.Namespace,
+    holdings: dict,
+) -> tuple[list[dict], list[dict], list[dict], float, str]:
+    strict_execution_profile(args)
+    connection = ibkr_state.connect()
+    ibkr_state.import_legacy_ledger(connection)
+    ib = ibkr_contracts.connect_ibkr()
+    try:
+        mode, account_id = validate_connected_execution_mode(
+            ib,
+            args.confirm_paper,
+            args.confirm_live,
+        )
+        summary, positions = ibkr_contracts.account_snapshot(ib, account_id)
+        netliq = net_liquidation_from_summary(summary)
+        rows, skipped = build_rows(holdings, "all_equities", netliq)
+        plans_by_con_id = qualify_execution_rows(ib, rows)
+        positions = qualify_held_positions(ib, positions, plans_by_con_id)
+        quote_plans = list(plans_by_con_id.values())
+        quotes = ibkr_contracts.snapshot_quotes(ib, quote_plans)
+        currencies = {
+            plan.currency
+            for plan in quote_plans
+            if plan.sec_type in {"STK", "OPT"}
+        }
+        fx_quotes = ibkr_contracts.snapshot_fx_quotes(ib, currencies)
+        fx_rates, fx_errors = ibkr_execution.executable_fx_rates(currencies, fx_quotes)
+        orders, planning_held = ibkr_execution.plan_order_deltas(
+            rows,
+            positions,
+            quotes,
+            fx_rates,
+            netliq,
+        )
+        used_today = ibkr_state.todays_order_count(connection)
+        selected, cap_held = ibkr_execution.slice_orders(
+            orders,
+            netliq,
+            used_today=used_today,
+            max_orders=args.max_orders,
+            max_daily_orders=args.max_daily_orders,
+            max_child_notional=args.max_notional,
+        )
+        selected, short_held = filter_short_orders(ib, selected, plans_by_con_id)
+        held_back = skipped + planning_held + cap_held + short_held
+        print_summary(rows, skipped, netliq, "all_equities")
+        print_order_preview(orders)
+        if mode == "live":
+            baseline = ibkr_state.live_baseline(connection, account_id)
+            print(
+                "Live baseline: "
+                + (
+                    f"${float(baseline['netliq']):,.2f} recorded at {baseline['recorded_at']}"
+                    if baseline
+                    else "MISSING (live execution will refuse to submit)"
+                )
+            )
+            alert_error = alerts.alert_health_error()
+            print(
+                "Alert health: "
+                + (f"BLOCKED - {alert_error}" if alert_error else "ready")
+            )
+        print(
+            f"\nExact {mode} execution preview: {len(selected)} child orders, "
+            f"${sum(float(order['actual_notional_usd']) for order in selected):,.2f} "
+            "limit notional"
+        )
+        for order in selected[:80]:
+            print(
+                f"  READY {order['side']:4s} {order['qty']:7g} "
+                f"{str(order.get('ticker') or '?'):18s} "
+                f"limit={order['limit_price']} "
+                f"notional=${order['actual_notional_usd']:,.2f}"
+            )
+        if fx_errors:
+            print("\nFX errors:")
+            for currency, error in sorted(fx_errors.items()):
+                print(f"  {currency}: {error}")
+        if held_back:
+            print(f"\nHeld/deferred: {len(held_back)}")
+            for item in held_back[:100]:
+                print(
+                    f"  HOLD {str(item.get('ticker') or item.get('local_symbol') or '?'):18s} "
+                    f"{item.get('skip_reason') or item.get('reason') or 'not executable'}"
+                )
+        return rows, held_back, selected, netliq, mode
+    finally:
+        ib.disconnect()
+        connection.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Plan IBKR Mimicry equity mirror orders")
-    parser.add_argument("--mode", choices=["foreign_only", "all_equities"], default="foreign_only")
+    parser.add_argument("--mode", choices=["foreign_only", "all_equities"], default="all_equities")
     parser.add_argument("--date", default=datetime.date.today().isoformat())
     parser.add_argument("--portfolio-value", type=float, help="Use this explicit USD value for target sizing")
     parser.add_argument(
@@ -1146,11 +1660,16 @@ def main() -> None:
     parser.add_argument("--no-price-fallback", action="store_true", help="Do not fall back to Mimicry close if IBKR price is unavailable")
     parser.add_argument("--show-ibkr-account", action="store_true", help="Print read-only IBKR account and positions snapshot")
     parser.add_argument("--show-open-orders", action="store_true", help="Print open IBKR orders")
-    parser.add_argument("--cancel-open-orders", action="store_true", help="Cancel all open IBKR orders visible to this client")
+    parser.add_argument("--cancel-open-orders", action="store_true", help="Cancel Mimicry-owned orders in the configured account")
     parser.add_argument("--preview-orders", action="store_true", help="Read IBKR positions and print proposed orders without executing")
-    parser.add_argument("--execute", action="store_true", help="Submit gated paper IBKR orders")
-    parser.add_argument("--confirm-paper", action="store_true", help="Required with --execute to confirm this is paper trading")
-    parser.add_argument("--confirm-live", action="store_true", help="Required with --execute to confirm live trading")
+    parser.add_argument(
+        "--preview-execution",
+        action="store_true",
+        help="Use the exact paper/live execution profile without cancelling or submitting",
+    )
+    parser.add_argument("--execute", action="store_true", help="Submit gated IBKR orders")
+    parser.add_argument("--confirm-paper", action="store_true", help="Confirm the configured account is paper")
+    parser.add_argument("--confirm-live", action="store_true", help="Confirm the configured account is live")
     parser.add_argument("--max-orders", type=int, help="Optional maximum orders to submit in one execution run")
     parser.add_argument("--max-notional", type=float, help="Optional maximum estimated USD notional per submitted order")
     parser.add_argument("--max-daily-orders", type=int, help="Optional maximum IBKR paper order submissions per local day")
@@ -1170,6 +1689,11 @@ def main() -> None:
         help="Cancel open IBKR orders before computing and submitting paper deltas",
     )
     parser.add_argument("--save-state", action="store_true", help="Save dry-run targets and order preview to last_state_ibkr.json")
+    parser.add_argument(
+        "--initialize-live-baseline",
+        action="store_true",
+        help="Record the configured live account NetLiq and submit no orders",
+    )
     args = parser.parse_args()
 
     if check_killswitch():
@@ -1178,6 +1702,7 @@ def main() -> None:
     planning_requested = any((
         args.execute,
         args.preview_orders,
+        args.preview_execution,
         args.qualify_contracts,
         args.ibkr_market_data,
         args.save_state,
@@ -1188,12 +1713,47 @@ def main() -> None:
     if args.cancel_before_execute and not (args.execute and (args.confirm_paper or args.confirm_live)):
         raise SystemExit("--cancel-before-execute requires --execute and --confirm-paper or --confirm-live")
     execution_mode = None
+    if args.initialize_live_baseline and not args.execute:
+        raise SystemExit("--initialize-live-baseline requires --execute --confirm-live")
+    if args.preview_execution:
+        if args.execute:
+            raise SystemExit("--preview-execution cannot be combined with --execute")
+        if args.confirm_paper == args.confirm_live:
+            raise SystemExit(
+                "--preview-execution requires exactly one of --confirm-paper or --confirm-live"
+            )
+        if args.holdings_json:
+            holdings = load_holdings_from_file(args.holdings_json)
+        else:
+            mirror.check_session_expiry()
+            holdings = mirror.fetch_holdings(args.date)
+        run_execution_preview(args, holdings)
+        return
     if args.execute:
-        execution_mode = validate_execution_mode(args.confirm_paper, args.confirm_live)
-        if execution_mode == "live":
-            if args.skip_shortability_check:
-                raise SystemExit("Live execution requires shortability checks")
-            apply_live_caps(args)
+        if args.confirm_paper == args.confirm_live:
+            raise SystemExit("--execute requires exactly one of --confirm-paper or --confirm-live")
+        if args.skip_shortability_check:
+            raise SystemExit("The live-like paper/live profile does not allow skipping shortability checks")
+        if args.portfolio_value is not None:
+            raise SystemExit("Execution always sizes from the configured IBKR account NetLiq")
+        if args.cancel_open_orders:
+            raise SystemExit("--execute already replaces Mimicry-owned orders; omit --cancel-open-orders")
+        if args.initialize_live_baseline:
+            holdings = {}
+        elif args.holdings_json:
+            holdings = load_holdings_from_file(args.holdings_json)
+        else:
+            mirror.check_session_expiry()
+            holdings = mirror.fetch_holdings(args.date)
+        rows, held_back, submitted_orders, portfolio_value, execution_mode = run_execution(
+            args,
+            holdings,
+        )
+        print(
+            f"\nIBKR {execution_mode} run complete: submitted {len(submitted_orders)}, "
+            f"held/deferred {len(held_back)}, NetLiq ${portfolio_value:,.2f}"
+        )
+        return
     elif args.cancel_open_orders:
         validate_execution_mode(args.confirm_paper, args.confirm_live)
     if ibkr_read_requested and not planning_requested:
@@ -1215,62 +1775,23 @@ def main() -> None:
     rows, skipped = build_rows(holdings, args.mode, portfolio_value)
     if args.ibkr_market_data:
         enrich_market_data(rows, use_fallback=not args.no_price_fallback)
-    if args.execute:
-        apply_execution_fx_guard(rows)
     print_summary(rows, skipped, portfolio_value, args.mode)
     print(f"Portfolio value source: {portfolio_value_source}")
     orders = []
     submitted_orders = []
-    if args.execute and args.cancel_before_execute:
-        remaining_open_orders = cancel_open_orders_for_paper()
-        if remaining_open_orders:
-            raise SystemExit("Open IBKR orders remain after cancel; skipping execution this run")
-    if args.preview_orders or args.execute:
+    if args.preview_orders:
         try:
             orders = build_order_preview(
                 rows,
                 min_order_notional=args.min_order_notional,
-                allow_fx_fallback=not args.execute,
-                limit_buffer_pct=LIVE_LIMIT_BUFFER_PCT if execution_mode == "live" else PAPER_LIMIT_BUFFER_PCT,
+                allow_fx_fallback=True,
+                limit_buffer_pct=PAPER_LIMIT_BUFFER_PCT,
             )
         except Exception as exc:
-            if args.execute:
-                raise
             print(f"\nIBKR order preview unavailable: {exc}")
             print("  Target dry run still completed; start IB Gateway to include current positions/orders.")
         else:
             print_order_preview(orders)
-    if args.execute:
-        max_orders = args.max_orders
-        if args.max_daily_orders is not None:
-            used_today = daily_execution_count()
-            remaining_today = max(0, args.max_daily_orders - used_today)
-            max_orders = remaining_today if max_orders is None else min(max_orders, remaining_today)
-            print(
-                f"\nIBKR daily order cap: {used_today}/{args.max_daily_orders} used; "
-                f"{remaining_today} remaining today"
-            )
-        if execution_mode == "live":
-            selected_for_sanity, _rejected_for_sanity = executable_orders(
-                orders,
-                max_orders=max_orders,
-                max_notional=args.max_notional,
-                order_type=args.order_type,
-            )
-            run_live_sanity_checks(selected_for_sanity, portfolio_value, previous_state)
-        run_id = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-        submitted_orders = execute_orders(
-            orders,
-            max_orders=max_orders,
-            max_notional=args.max_notional,
-            outside_rth=args.allow_outside_rth,
-            order_routing=args.order_routing,
-            order_type=args.order_type,
-            verify_shortability=not args.skip_shortability_check,
-        )
-        for order in submitted_orders:
-            order["run_id"] = run_id
-        record_submitted_orders(submitted_orders)
     if args.qualify_contracts:
         qualify_rows(rows, args.qualify_limit)
     if args.show_ibkr_account:

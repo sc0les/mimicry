@@ -1,0 +1,11 @@
+[Unit]
+Description=Send Mimicry daily heartbeat
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 16:35:00 America/New_York
+Persistent=true
+AccuracySec=1s
+Unit=mimicry-heartbeat.service
+
+[Install]
+WantedBy=timers.target

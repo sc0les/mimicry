@@ -1,0 +1,17 @@
+[Unit]
+Description=Mimicry Pushover delivery self-test
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=mimicry
+WorkingDirectory=/opt/mimicry
+EnvironmentFile=/opt/mimicry/secrets.env
+ExecStart=/opt/mimicry-env/bin/python3 /opt/mimicry/alerts.py --self-test
+TimeoutStartSec=2min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/mimicry /tmp
+StandardOutput=journal
+StandardError=journal

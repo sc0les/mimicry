@@ -1,0 +1,16 @@
+[Unit]
+Description=Mimicry active-runner deadman check
+
+[Service]
+Type=oneshot
+User=mimicry
+WorkingDirectory=/opt/mimicry
+EnvironmentFile=/opt/mimicry/secrets.env
+ExecStart=/opt/mimicry/run_deadman_check.sh
+TimeoutStartSec=10min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/mimicry /tmp
+StandardOutput=journal
+StandardError=journal

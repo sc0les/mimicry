@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Mimicry IBKR mirror every 15 minutes on weekdays
+
+[Timer]
+OnCalendar=Sun *-*-* 18..23:00/15:00 America/New_York
+OnCalendar=Mon..Thu *-*-* *:00/15:00 America/New_York
+OnCalendar=Fri *-*-* 00..17:00/15:00 America/New_York
+Persistent=true
+AccuracySec=1s
+Unit=mimicry-mirror.service
+
+[Install]
+WantedBy=timers.target

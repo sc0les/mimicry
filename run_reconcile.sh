@@ -20,4 +20,5 @@ if ! flock -n 9; then
 fi
 
 cd "$MIMICRY_HOME"
-"$MIMICRY_HOME/run_alerted.sh" "IBKR reconcile" "$LOG_FILE" timeout 15m "$MIMICRY_PYTHON" reconcile.py
+"$MIMICRY_HOME/run_alerted.sh" "IBKR reconcile ${IBKR_EXECUTION_MODE:-paper}" "$LOG_FILE" \
+  timeout 15m "$MIMICRY_PYTHON" reconcile.py --mode "${IBKR_EXECUTION_MODE:-paper}"

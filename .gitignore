@@ -20,6 +20,10 @@ deadman.log
 
 # Exploration / scratch files
 *.json
+mimicry_state.sqlite3
+mimicry_state.sqlite3-*
+.backup-staging/
+mimicry_api_explorer.py
 *.png
 *.html
 capture_*.py
