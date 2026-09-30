@@ -1,334 +1,343 @@
 #!/usr/bin/env python3
-"""Reconcile IBKR orders and positions against Mimicry targets."""
+"""Reconcile IBKR order state and account positions against Mimicry."""
 
 from __future__ import annotations
 
 import argparse
 import datetime
-import json
-from collections import defaultdict
+import os
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import alerts
 import ibkr_contracts
+import ibkr_execution
+import ibkr_state
 import mirror
 import mirror_ibkr
 
 
 ROOT = Path(__file__).resolve().parent
 RECONCILE_LOG = ROOT / "reconcile.log"
-RECONCILE_ALERT_STATE_FILE = ROOT / "reconcile_alert_state.json"
 DEFAULT_DRIFT_THRESHOLD_PCT = 0.5
-
 WORKING_STATUSES = {"PendingSubmit", "PreSubmitted", "Submitted"}
-REJECTED_STATUSES = {"Cancelled", "ApiCancelled", "Inactive", "ValidationError", "skipped"}
+REJECTED_STATUSES = {
+    "Cancelled",
+    "ApiCancelled",
+    "Inactive",
+    "ValidationError",
+    "validation_error",
+    "submission_unknown",
+}
 
 
-def load_ledger() -> list[dict]:
-    return mirror_ibkr.load_execution_ledger()
+def classify_order(order: dict) -> str:
+    requested = float(order.get("requested_qty") or 0)
+    filled = float(order.get("filled_qty") or 0)
+    remaining = float(order.get("remaining_qty") or max(0.0, requested - filled))
+    status = str(order.get("status") or "unknown")
+    if requested and filled >= requested:
+        return "filled"
+    if filled > 0 and remaining > 0:
+        return "partial"
+    if status in WORKING_STATUSES:
+        return "working"
+    if status in REJECTED_STATUSES:
+        return "rejected"
+    return status.lower()
 
 
-def latest_run_orders(ledger: list[dict]) -> list[dict]:
-    if not ledger:
-        return []
-    run_ids = [entry.get("run_id") for entry in ledger if entry.get("run_id")]
-    if run_ids:
-        latest = max(run_ids)
-        return [entry for entry in ledger if entry.get("run_id") == latest]
-    latest_timestamp = max(entry.get("timestamp", "") for entry in ledger)
-    return [entry for entry in ledger if entry.get("timestamp") == latest_timestamp]
-
-
-def load_alert_state() -> dict:
-    if not RECONCILE_ALERT_STATE_FILE.exists():
-        return {"alerted_keys": []}
-    try:
-        data = json.loads(RECONCILE_ALERT_STATE_FILE.read_text())
-    except Exception:
-        return {"alerted_keys": []}
-    if not isinstance(data, dict):
-        return {"alerted_keys": []}
-    data.setdefault("alerted_keys", [])
-    return data
-
-
-def save_alert_state(state: dict) -> None:
-    RECONCILE_ALERT_STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True))
-
-
-def order_alert_key(order: dict) -> str:
-    return ":".join(
-        str(part)
-        for part in (
-            order.get("run_id") or order.get("date"),
-            order.get("order_id"),
-            order.get("ticker"),
-            order.get("classification"),
-            order.get("filled_qty"),
-            order.get("remaining_qty"),
+def signed_working_quantities(ib, account_id: str) -> dict[int, float]:
+    working = defaultdict(float)
+    for trade in ibkr_execution.owned_open_trades(ib, account_id):
+        con_id = int(getattr(trade.contract, "conId", 0) or 0)
+        if not con_id:
+            continue
+        remaining = float(
+            getattr(trade.orderStatus, "remaining", 0)
+            or getattr(trade.order, "totalQuantity", 0)
+            or 0
         )
-    )
+        working[con_id] += remaining if trade.order.action.upper() == "BUY" else -remaining
+    return dict(working)
 
 
-def new_order_alerts(classified: list[dict]) -> list[dict]:
-    state = load_alert_state()
-    seen = set(state.get("alerted_keys", []))
-    new_orders = []
-    for order in classified:
-        if order["classification"] not in {"partial", "rejected"}:
-            continue
-        key = order_alert_key(order)
-        if key in seen:
-            continue
-        new_orders.append(order)
-        seen.add(key)
-    state["alerted_keys"] = sorted(seen)[-1000:]
-    save_alert_state(state)
-    return new_orders
-
-
-def completed_and_open_orders(ib) -> tuple[dict[int, object], dict[int, object], dict[int, list]]:
-    open_by_id = {}
-    for trade in mirror_ibkr.all_open_trades(ib):
-        order_id = getattr(trade.order, "orderId", None)
-        if order_id is not None:
-            open_by_id[int(order_id)] = trade
-
-    completed_by_id = {}
-    try:
-        completed = ib.reqCompletedOrders(False)
-    except Exception:
-        completed = []
-    for trade in completed or []:
-        order_id = getattr(trade.order, "orderId", None)
-        if order_id is not None:
-            completed_by_id[int(order_id)] = trade
-
-    executions_by_order_id = defaultdict(list)
-    try:
-        executions = ib.reqExecutions()
-    except Exception:
-        executions = []
-    for execution_report in executions or []:
-        execution = execution_report.execution
-        order_id = getattr(execution, "orderId", None)
-        if order_id is not None:
-            executions_by_order_id[int(order_id)].append(execution)
-
-    return open_by_id, completed_by_id, executions_by_order_id
-
-
-def classify_order(entry: dict, trade=None, executions: list | None = None) -> dict:
-    executions = executions or []
-    status = entry.get("final_status") or entry.get("status") or "unknown"
-    requested_qty = float(entry.get("requested_qty") or entry.get("qty") or 0)
-    filled_qty = float(entry.get("filled_qty") or 0)
-    remaining_qty = float(entry.get("remaining_qty") or max(0.0, requested_qty - filled_qty))
-    avg_fill_price = entry.get("avg_fill_price")
-
-    if trade is not None:
-        status_obj = trade.orderStatus
-        status = status_obj.status or status
-        filled_qty = float(status_obj.filled or filled_qty)
-        remaining_qty = float(status_obj.remaining or remaining_qty)
-        avg_fill_price = float(status_obj.avgFillPrice or 0) or avg_fill_price
-
-    if executions:
-        filled_qty = sum(float(execution.shares or 0) for execution in executions)
-        if filled_qty and requested_qty:
-            remaining_qty = max(0.0, requested_qty - filled_qty)
-        total_value = sum(float(execution.shares or 0) * float(execution.price or 0) for execution in executions)
-        avg_fill_price = total_value / filled_qty if filled_qty else avg_fill_price
-
-    if filled_qty >= requested_qty and requested_qty:
-        state = "filled"
-    elif filled_qty > 0 and remaining_qty > 0:
-        state = "partial"
-    elif status in WORKING_STATUSES:
-        state = "working"
-    elif status in REJECTED_STATUSES:
-        state = "rejected"
-    else:
-        state = status.lower()
-
-    return {
-        **entry,
-        "classification": state,
-        "status": status,
-        "final_status": status,
-        "requested_qty": requested_qty,
-        "filled_qty": filled_qty,
-        "remaining_qty": remaining_qty,
-        "avg_fill_price": avg_fill_price,
-    }
-
-
-def current_target_rows(date: str, portfolio_value: float) -> list[dict]:
-    mirror.check_session_expiry()
-    holdings = mirror.fetch_holdings(date)
-    rows, _skipped = mirror_ibkr.build_rows(holdings, "all_equities", portfolio_value)
-    return [row for row in rows if row.get("con_id") and row.get("skip_reason") is None]
-
-
-def position_drift_rows(rows: list[dict], positions: list[dict], portfolio_value: float, threshold_pct: float) -> list[dict]:
+def position_drifts(
+    rows: list[dict],
+    positions: list[dict],
+    quotes: dict[int, ibkr_contracts.Quote],
+    fx_rates: dict[str, float],
+    working: dict[int, float],
+    netliq: float,
+    threshold_pct: float,
+) -> tuple[list[dict], list[str]]:
     positions_by_con_id = {
         int(position["con_id"]): position
         for position in positions
-        if position.get("con_id")
+        if position.get("con_id") and position.get("sec_type") in {"STK", "OPT"}
     }
-    drifts = []
     target_con_ids = set()
+    drifts = []
+    errors = []
     for row in rows:
-        con_id = int(row["con_id"])
-        target_con_ids.add(con_id)
-        target_qty = float(row.get("target_qty") or 0)
-        actual_qty = float(positions_by_con_id.get(con_id, {}).get("position", 0.0))
-        if not target_qty:
+        con_id = int(row.get("con_id") or 0)
+        if not con_id:
+            if abs(float(row.get("weight") or 0)) > threshold_pct:
+                errors.append(
+                    f"{row.get('ticker')}: target has no qualified IBKR contract "
+                    f"({row.get('skip_reason') or 'unknown reason'})"
+                )
             continue
-        per_share_usd = row["target_value"] / abs(target_qty)
-        drift_value = abs(actual_qty - target_qty) * per_share_usd
-        drift_pct = drift_value / portfolio_value * 100 if portfolio_value else 0
+        target_con_ids.add(con_id)
+        if ibkr_execution.market_is_open(row) is False:
+            continue
+        quote = quotes.get(con_id)
+        quote_error = ibkr_execution.quote_validation_error(quote)
+        fx_rate = ibkr_execution.finite_positive(fx_rates.get(row.get("currency")))
+        if quote_error or fx_rate is None:
+            errors.append(
+                f"{row.get('ticker')}: {quote_error or 'missing executable FX'}"
+            )
+            continue
+        current_qty = float(positions_by_con_id.get(con_id, {}).get("position", 0))
+        force_exit, _reason = ibkr_execution.option_expiry_action(row, current_qty)
+        price = (float(quote.bid) + float(quote.ask)) / 2
+        target_qty = 0 if force_exit else ibkr_execution.target_quantity(
+            row,
+            netliq,
+            price,
+            fx_rate,
+        )
+        effective_qty = current_qty + float(working.get(con_id, 0))
+        drift_value = ibkr_execution.order_notional_usd(
+            effective_qty - target_qty,
+            price,
+            row,
+            fx_rate,
+        )
+        drift_pct = drift_value / netliq * 100 if netliq else 0
         if drift_pct > threshold_pct:
             drifts.append({
-                "ticker": row["ticker"],
+                "ticker": row.get("ticker"),
                 "con_id": con_id,
                 "target_qty": target_qty,
-                "actual_qty": actual_qty,
-                "drift_pct": drift_pct,
+                "actual_qty": current_qty,
+                "working_qty": float(working.get(con_id, 0)),
+                "effective_qty": effective_qty,
                 "drift_value": drift_value,
+                "drift_pct": drift_pct,
             })
 
     for position in positions:
-        con_id = position.get("con_id")
-        if not con_id or int(con_id) in target_con_ids:
-            continue
+        con_id = int(position.get("con_id") or 0)
         qty = float(position.get("position") or 0)
-        if not qty:
+        if (
+            not con_id
+            or con_id in target_con_ids
+            or qty == 0
+            or position.get("sec_type") not in {"STK", "OPT"}
+        ):
             continue
-        avg_cost = abs(float(position.get("avg_cost") or 0))
-        drift_value = abs(qty) * avg_cost
-        drift_pct = drift_value / portfolio_value * 100 if portfolio_value and drift_value else 0
+        if ibkr_execution.market_is_open(position) is False:
+            continue
+        quote = quotes.get(con_id)
+        quote_error = ibkr_execution.quote_validation_error(quote)
+        fx_rate = ibkr_execution.finite_positive(fx_rates.get(position.get("currency")))
+        if quote_error or fx_rate is None:
+            errors.append(
+                f"{position.get('local_symbol') or position.get('symbol')}: "
+                f"{quote_error or 'missing executable FX'}"
+            )
+            continue
+        price = (float(quote.bid) + float(quote.ask)) / 2
+        effective_qty = qty + float(working.get(con_id, 0))
+        drift_value = ibkr_execution.order_notional_usd(
+            effective_qty,
+            price,
+            position,
+            fx_rate,
+        )
+        drift_pct = drift_value / netliq * 100 if netliq else 0
         if drift_pct > threshold_pct:
             drifts.append({
-                "ticker": position.get("symbol"),
-                "con_id": int(con_id),
-                "target_qty": 0.0,
+                "ticker": position.get("local_symbol") or position.get("symbol"),
+                "con_id": con_id,
+                "target_qty": 0,
                 "actual_qty": qty,
-                "drift_pct": drift_pct,
+                "working_qty": float(working.get(con_id, 0)),
+                "effective_qty": effective_qty,
                 "drift_value": drift_value,
+                "drift_pct": drift_pct,
             })
-
-    return sorted(drifts, key=lambda item: -item["drift_pct"])
-
-
-def append_report(text: str) -> None:
-    with open(RECONCILE_LOG, "a") as handle:
-        handle.write(text.rstrip() + "\n\n")
+    return sorted(drifts, key=lambda item: -item["drift_pct"]), errors
 
 
-def update_ledger_with_classifications(ledger: list[dict], classified: list[dict]) -> None:
-    by_identity = {}
-    for order in classified:
-        key = (order.get("run_id"), order.get("order_id"), order.get("ticker"), order.get("side"))
-        by_identity[key] = order
+def append_report(report: str) -> None:
+    with RECONCILE_LOG.open("a") as handle:
+        handle.write(report.rstrip() + "\n\n")
 
-    changed = False
-    for entry in ledger:
-        key = (entry.get("run_id"), entry.get("order_id"), entry.get("ticker"), entry.get("side"))
-        update = by_identity.get(key)
-        if not update:
+
+def new_rejected_orders(connection, orders: list[dict]) -> list[dict]:
+    new_rejections = []
+    for order in orders:
+        if classify_order(order) != "rejected":
             continue
-        for field in (
-            "classification",
-            "status",
-            "final_status",
-            "requested_qty",
-            "filled_qty",
-            "remaining_qty",
-            "avg_fill_price",
-            "rejection_reason",
-        ):
-            if update.get(field) != entry.get(field):
-                entry[field] = update.get(field)
-                changed = True
-        entry["reconciled_at"] = datetime.datetime.now().isoformat()
-        changed = True
-
-    if changed:
-        mirror_ibkr.save_execution_ledger(ledger)
+        key = f"reconcile_alerted_order:{order['intent_id']}"
+        if ibkr_state.get_meta(connection, key):
+            continue
+        ibkr_state.set_meta(connection, key, ibkr_state.utc_now())
+        new_rejections.append(order)
+    connection.commit()
+    return new_rejections
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Reconcile IBKR mirror state")
     parser.add_argument("--date", default=datetime.date.today().isoformat())
+    parser.add_argument(
+        "--mode",
+        choices=["paper", "live"],
+        default=os.environ.get("IBKR_EXECUTION_MODE", "paper"),
+    )
+    parser.add_argument("--holdings-json")
     parser.add_argument("--drift-threshold", type=float, default=DEFAULT_DRIFT_THRESHOLD_PCT)
     parser.add_argument("--no-alert", action="store_true")
     args = parser.parse_args()
 
-    portfolio_value = mirror_ibkr.load_ibkr_net_liquidation()
+    connection = ibkr_state.connect()
+    ibkr_state.import_legacy_ledger(connection)
     ib = ibkr_contracts.connect_ibkr()
     try:
-        _summary, positions = ibkr_contracts.account_snapshot(ib)
-        open_by_id, completed_by_id, executions_by_order_id = completed_and_open_orders(ib)
+        account_id = ibkr_contracts.require_account_id(ib)
+        account_is_paper = account_id.upper().startswith("DU")
+        if (args.mode == "paper") != account_is_paper:
+            raise RuntimeError(
+                f"reconcile mode {args.mode!r} does not match configured account {account_id}"
+            )
+        ibkr_execution.recover_broker_orders(connection, ib, account_id)
+        summary, positions = ibkr_contracts.account_snapshot(ib, account_id)
+        netliq = mirror_ibkr.net_liquidation_from_summary(summary)
+
+        if args.holdings_json:
+            holdings = mirror_ibkr.load_holdings_from_file(args.holdings_json)
+        else:
+            mirror.check_session_expiry()
+            holdings = mirror.fetch_holdings(args.date)
+        rows, skipped = mirror_ibkr.build_rows(holdings, "all_equities", netliq)
+        plans_by_con_id = mirror_ibkr.qualify_execution_rows(ib, rows)
+        positions = mirror_ibkr.qualify_held_positions(ib, positions, plans_by_con_id)
+        plans = list(plans_by_con_id.values())
+        quotes = ibkr_contracts.snapshot_quotes(ib, plans)
+        currencies = {plan.currency for plan in plans}
+        fx_quotes = ibkr_contracts.snapshot_fx_quotes(ib, currencies)
+        fx_rates, fx_errors = ibkr_execution.executable_fx_rates(currencies, fx_quotes)
+        working = signed_working_quantities(ib, account_id)
+        drifts, market_errors = position_drifts(
+            rows,
+            positions,
+            quotes,
+            fx_rates,
+            working,
+            netliq,
+            args.drift_threshold,
+        )
+
+        orders = ibkr_state.latest_run_orders(
+            connection,
+            mode=args.mode,
+            account_id=account_id,
+        )
+        states = Counter(classify_order(order) for order in orders)
+        new_rejections = new_rejected_orders(connection, orders)
+        market_errors.extend(
+            f"{currency}: {error}" for currency, error in sorted(fx_errors.items())
+        )
+        market_errors.extend(
+            f"{item.get('ticker')}: {item.get('skip_reason')}"
+            for item in skipped
+            if abs(float(item.get("weight") or 0)) > args.drift_threshold
+        )
+        run_id = orders[0]["run_id"] if orders else None
+
+        lines = [
+            f"IBKR reconciliation - {datetime.datetime.now(datetime.timezone.utc).isoformat()}",
+            f"Mode/account: {args.mode} / {account_id}",
+            f"Source date: {args.date}",
+            f"NetLiq: ${netliq:,.2f}",
+            f"Latest run orders: {len(orders)}",
+            "Order states: "
+            + (", ".join(f"{key}={value}" for key, value in sorted(states.items())) or "none"),
+            f"Owned working orders: {len(working)} contracts",
+            f"Drift threshold: {args.drift_threshold:.2f}%",
+            f"Unexpected drift breaches: {len(drifts)}",
+            f"Pricing/contract errors: {len(market_errors)}",
+        ]
+        if orders:
+            lines.append("\nLatest run order detail:")
+            for order in orders[:80]:
+                lines.append(
+                    f"  {classify_order(order):9s} {order.get('action', '?'):4s} "
+                    f"{float(order.get('requested_qty') or 0):7.0f} "
+                    f"{str(order.get('ticker') or '?'):18s} "
+                    f"filled={float(order.get('filled_qty') or 0):.0f} "
+                    f"remaining={float(order.get('remaining_qty') or 0):.0f} "
+                    f"status={order.get('status')}"
+                )
+        if drifts:
+            lines.append("\nUnexpected position drift:")
+            for item in drifts[:80]:
+                lines.append(
+                    f"  {str(item['ticker']):18s} target={item['target_qty']:,.0f} "
+                    f"actual={item['actual_qty']:,.0f} working={item['working_qty']:,.0f} "
+                    f"drift={item['drift_pct']:.2f}% (${item['drift_value']:,.0f})"
+                )
+        if market_errors:
+            lines.append("\nPricing/contract errors:")
+            lines.extend(f"  {error}" for error in market_errors[:80])
+
+        report = "\n".join(lines)
+        print(report)
+        append_report(report)
+        has_issue = bool(drifts or market_errors or new_rejections)
+        technical_failure = bool(market_errors or new_rejections)
+        reconciliation_status = (
+            "failed"
+            if technical_failure
+            else "drift"
+            if drifts
+            else "completed"
+        )
+        ibkr_state.record_reconciliation(
+            connection,
+            mode=args.mode,
+            account_id=account_id,
+            netliq=netliq,
+            drift_count=len(drifts),
+            max_drift_pct=max((item["drift_pct"] for item in drifts), default=0),
+            status=reconciliation_status,
+            report=report,
+            run_id=run_id,
+        )
+        ibkr_state.record_netliq(
+            connection,
+            mode=args.mode,
+            account_id=account_id,
+            kind="reconciliation",
+            netliq=netliq,
+            run_id=run_id,
+        )
+        if has_issue and not args.no_alert:
+            if not alerts.send_alert(
+                "Mimicry IBKR reconciliation issue",
+                report[:1024],
+                priority=1,
+            ):
+                raise RuntimeError("reconciliation alert delivery failed")
+        if technical_failure:
+            raise SystemExit(1)
     finally:
         ib.disconnect()
-
-    ledger = load_ledger()
-    run_orders = latest_run_orders(ledger)
-    classified = []
-    for entry in run_orders:
-        order_id = entry.get("order_id")
-        trade = None
-        executions = []
-        if order_id is not None:
-            order_id = int(order_id)
-            trade = open_by_id.get(order_id) or completed_by_id.get(order_id)
-            executions = executions_by_order_id.get(order_id, [])
-        classified.append(classify_order(entry, trade=trade, executions=executions))
-    update_ledger_with_classifications(ledger, classified)
-
-    target_rows = current_target_rows(args.date, portfolio_value)
-    drifts = position_drift_rows(target_rows, positions, portfolio_value, args.drift_threshold)
-    status_counts = defaultdict(int)
-    for order in classified:
-        status_counts[order["classification"]] += 1
-
-    lines = [
-        f"IBKR reconciliation - {datetime.datetime.now().isoformat()}",
-        f"Date: {args.date}",
-        f"NetLiq: ${portfolio_value:,.2f}",
-        f"Latest run orders: {len(classified)}",
-        "Order states: " + (", ".join(f"{key}={value}" for key, value in sorted(status_counts.items())) or "none"),
-        f"Positions checked: {len(target_rows)}",
-        f"Drift threshold: {args.drift_threshold:.2f}%",
-        f"Drift breaches: {len(drifts)}",
-    ]
-
-    if classified:
-        lines.append("\nLatest run order detail:")
-        for order in classified[:80]:
-            lines.append(
-                f"  {order.get('classification'):8s} {order.get('side', '?'):4s} "
-                f"{float(order.get('requested_qty') or 0):7.0f} {order.get('ticker', '?'):12s} "
-                f"filled={float(order.get('filled_qty') or 0):.0f} remaining={float(order.get('remaining_qty') or 0):.0f} "
-                f"status={order.get('status')}"
-            )
-
-    if drifts:
-        lines.append("\nPosition drift:")
-        for item in drifts[:50]:
-            lines.append(
-                f"  {item['ticker']:12s} target={item['target_qty']:,.0f} actual={item['actual_qty']:,.0f} "
-                f"drift={item['drift_pct']:.2f}% (${item['drift_value']:,.0f})"
-            )
-
-    report = "\n".join(lines)
-    print(report)
-    append_report(report)
-
-    newly_alertable_orders = new_order_alerts(classified)
-    if (drifts or newly_alertable_orders) and not args.no_alert:
-        alerts.send_alert("Mimicry IBKR reconciliation issue", report[:1024], priority=1)
+        connection.close()
 
 
 if __name__ == "__main__":

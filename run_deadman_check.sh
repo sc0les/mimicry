@@ -13,4 +13,6 @@ export MIMICRY_PYTHON
 LOG_FILE="$MIMICRY_HOME/deadman.log"
 
 cd "$MIMICRY_HOME"
-"$MIMICRY_HOME/run_alerted.sh" "Deadman check" "$LOG_FILE" timeout 5m "$MIMICRY_PYTHON" deadman_check.py --no-alert
+"$MIMICRY_HOME/run_alerted.sh" "Deadman check ${IBKR_EXECUTION_MODE:-paper}" "$LOG_FILE" \
+  timeout 5m "$MIMICRY_PYTHON" deadman_check.py \
+  --mode "${IBKR_EXECUTION_MODE:-paper}" --max-age-minutes 45 --force --no-alert

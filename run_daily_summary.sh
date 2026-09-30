@@ -13,4 +13,5 @@ export MIMICRY_PYTHON
 LOG_FILE="$MIMICRY_HOME/daily_summary.log"
 
 cd "$MIMICRY_HOME"
-"$MIMICRY_HOME/run_alerted.sh" "Daily heartbeat" "$LOG_FILE" timeout 15m "$MIMICRY_PYTHON" daily_summary.py
+"$MIMICRY_HOME/run_alerted.sh" "Daily heartbeat ${IBKR_EXECUTION_MODE:-paper}" "$LOG_FILE" \
+  timeout 15m "$MIMICRY_PYTHON" daily_summary.py --mode "${IBKR_EXECUTION_MODE:-paper}"

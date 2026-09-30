@@ -23,11 +23,17 @@ STARTED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 RC=$?
 FINISHED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
-{
+if [ "$LOG_FILE" = "-" ]; then
   echo
   echo "===== $NAME started=$STARTED_AT finished=$FINISHED_AT rc=$RC ====="
   cat "$TMP_OUTPUT"
-} >> "$LOG_FILE"
+else
+  {
+    echo
+    echo "===== $NAME started=$STARTED_AT finished=$FINISHED_AT rc=$RC ====="
+    cat "$TMP_OUTPUT"
+  } >> "$LOG_FILE"
+fi
 
 if [ "$RC" -ne 0 ]; then
   {
