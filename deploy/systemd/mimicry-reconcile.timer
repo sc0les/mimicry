@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Mimicry reconciliation after US market close
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 16:15:00 America/New_York
+Persistent=true
+AccuracySec=1s
+Unit=mimicry-reconcile.service
+
+[Install]
+WantedBy=timers.target

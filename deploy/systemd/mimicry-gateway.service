@@ -1,0 +1,24 @@
+[Unit]
+Description=Mimicry IB Gateway under IBC
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mimicry
+WorkingDirectory=/opt/mimicry
+EnvironmentFile=/opt/mimicry/secrets.env
+ExecStart=/opt/mimicry/run_ibkr_gateway.sh
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=45
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt /tmp
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

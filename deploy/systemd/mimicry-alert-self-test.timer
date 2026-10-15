@@ -1,0 +1,11 @@
+[Unit]
+Description=Verify Pushover before trading starts
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 05:45:00 America/New_York
+Persistent=true
+AccuracySec=1s
+Unit=mimicry-alert-self-test.service
+
+[Install]
+WantedBy=timers.target

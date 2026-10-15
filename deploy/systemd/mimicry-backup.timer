@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up Mimicry state daily
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 America/New_York
+Persistent=true
+AccuracySec=1min
+Unit=mimicry-backup.service
+
+[Install]
+WantedBy=timers.target
