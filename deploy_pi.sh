@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-HOST="${1:-mimicry-pi}"
+HOST="${1:?Usage: deploy_pi.sh user@host (existing /opt/mimicry installation)}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
 ARCHIVE="$(mktemp -t mimicry-deploy)"
