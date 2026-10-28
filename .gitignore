@@ -1,5 +1,27 @@
 # Secrets & session state
 secrets.env
+secrets.env.*
+!secrets.env.example
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+credentials*
+*.log
+*.log.*
+*.sqlite*
+*.db
+*.db-*
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.age
+backups/
 browser_state.json
 last_state.json
 last_state_ibkr.json
@@ -20,6 +42,11 @@ deadman.log
 
 # Exploration / scratch files
 *.json
+mimicry_state.sqlite3
+mimicry_state.sqlite3-*
+.backup-staging/
+mimicry_api_explorer.py
+*_api_explorer.py
 *.png
 *.html
 capture_*.py
@@ -34,3 +61,9 @@ __pycache__/
 *.pyc
 *.pyo
 .env
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+.DS_Store
